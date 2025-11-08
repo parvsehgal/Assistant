@@ -3,31 +3,46 @@ const http = require("http");
 const helper = require("./utils/audiofunctions.js");
 const server = http.createServer();
 require("dotenv").config();
+
 const gptKey = process.env.KEY;
 const wss = new WebSocket.Server({ noServer: true });
 
 wss.on("connection", (ws) => {
   console.log("Client connected to /Assistant");
-  console.log(process.env.KEY);
-  //generate a gpt ws client for our user
+
+  // Message queue for messages received before gptClient is ready
+  const messageQueue = [];
+  let gptClientReady = false;
+
+  // Generate a gpt ws client for our user
   const url =
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01";
   const gptClient = new WebSocket(url, {
     headers: {
-      Authorization: "Bearer " + `${gptKey}`,
+      Authorization: `Bearer ${gptKey}`,
       "OpenAI-Beta": "realtime=v1",
     },
   });
-  //when gpt client gets connected to openai's WebSocket server
+
+  // When gpt client gets connected to openai's WebSocket server
   gptClient.on("open", function open() {
     console.log("Connected to gpt WebSocket server.");
+    gptClientReady = true;
+
+    // Send queued messages
+    while (messageQueue.length > 0) {
+      const queuedMessage = messageQueue.shift();
+      gptClient.send(queuedMessage);
+    }
+
     ws.send("your gpt client is ready for u to use");
   });
-  //when out gpt client gets a message from the openai server
+
+  // When our gpt client gets a message from the openai server
   gptClient.on("message", (data) => {
-    // Convert Buffer to string if data is binary
     const parsedData = JSON.parse(data);
     console.log(parsedData.type);
+
     if (parsedData.type === "response.audio.delta") {
       const pcmData = helper.base64ToArrayBuffer(parsedData.delta);
       const sampleRate = 24000;
@@ -41,15 +56,42 @@ wss.on("connection", (ws) => {
       ws.send(JSON.stringify(parsedData));
     }
   });
+
+  // Handle errors from gptClient
+  gptClient.on("error", (error) => {
+    console.error("GPT WebSocket error:", error);
+    ws.send(
+      JSON.stringify({
+        type: "error",
+        error: {
+          message: "Connection to OpenAI failed",
+          details: error.message,
+        },
+      }),
+    );
+  });
+
+  // Handle gptClient closure
+  gptClient.on("close", () => {
+    console.log("GPT WebSocket closed");
+    ws.close();
+  });
+
   // Handle messages from the client
   ws.on("message", (message) => {
     try {
       const event = JSON.parse(message);
-      // Forward the event to OpenAI's WebSocket
-      gptClient.send(JSON.stringify(event));
+
+      // Check if gptClient is ready before sending
+      if (gptClientReady && gptClient.readyState === WebSocket.OPEN) {
+        gptClient.send(JSON.stringify(event));
+      } else {
+        // Queue the message if gptClient is not ready yet
+        console.log("Queueing message until GPT client is ready");
+        messageQueue.push(JSON.stringify(event));
+      }
     } catch (e) {
       console.error("Error parsing message from client:", e);
-      // Optionally, send an error back to the client
       const errorEvent = {
         type: "error",
         error: {
@@ -58,6 +100,14 @@ wss.on("connection", (ws) => {
         },
       };
       ws.send(JSON.stringify(errorEvent));
+    }
+  });
+
+  // Handle client disconnection
+  ws.on("close", () => {
+    console.log("Client disconnected");
+    if (gptClient.readyState === WebSocket.OPEN) {
+      gptClient.close();
     }
   });
 });
